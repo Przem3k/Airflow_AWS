@@ -1,17 +1,28 @@
-import boto3
-import time
+
+
 from airflow import DAG, task
 from airflow.operators.python import PythonOperator
+from airflow.operators.python import BranchPythonOperator
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.models.baseoperator import BaseOperator
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.utils.decorators import apply_defaults
+
+
+
+
 from airflow.hooks.base import BaseHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.hooks.postgres_hook import PostgresHook
 from airflow.utils.dates import days_ago
 from airflow.models import Variable
-
+from airflow.sensors.base import BaseSensorOperator
+from airflow.utils.decorators import apply_defaults
+import boto3
 import json
 import pandas as pd
+import time
 import os
 import logging
 import io
@@ -214,8 +225,91 @@ AWS_CONN_ID = "aws_default"
 INCOMING_BUCKET_NAME = 'dev-spacelift-self-hosted-data-incoming'
 PROCESSING_BUCKET_NAME = 'dev-spacelift-self-hosted-data-processing'
 ARCHIVE_BUCKET_NAME = 'dev-spacelift-self-hosted-data-archive'
+ERROR_BUCKET_NAME = 'dev-spacelift-self-hosted-data-error'
 LOAD_TIME = current_time = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
 IAM_ROLE = 'arn:aws:iam::467135700742:role/ssm-analysis-role'
+
+
+class S3TagSensor(BaseSensorOperator):
+    """
+    Sensor that monitors an S3 bucket for new files without the 'processed' tag.
+    Uses 'reschedule' mode to optimize resource usage.
+
+    :param bucket_name: Name of the S3 bucket
+    :param prefix: Folder prefix to monitor (e.g., "input/")
+    :param aws_conn_id: AWS connection ID in Airflow (default: "aws_default")
+    """
+
+    template_fields = ("prefix",)
+
+    @apply_defaults
+    def __init__(self, bucket_name, prefix, aws_conn_id="aws_default", *args, **kwargs):
+        super().__init__(*args, mode="reschedule", **kwargs)
+        self.bucket_name = bucket_name
+        self.prefix = prefix
+        self.aws_conn_id = aws_conn_id
+
+    def poke(self, context):
+        """ Checks S3 for new files without the 'processed' tag """
+        # s3_hook = S3Hook(aws_conn_id=self.aws_conn_id)
+        # s3_client = s3_hook.get_client_type("s3")
+
+        aws_connection = BaseHook.get_connection(self.aws_conn_id)
+        aws_access_key = aws_connection.login
+        aws_secret_key = aws_connection.password
+        extra = json.loads(aws_connection.extra) if aws_connection.extra else {}
+        region_name = extra.get("region_name", "eu-west-1")
+        s3_client = boto3.client('s3',
+                          aws_access_key_id=aws_access_key,
+                          aws_secret_access_key=aws_secret_key,
+                          region_name=region_name,
+                          )
+
+        self.log.info(f"Checking for new files in: s3://{self.bucket_name}/{self.prefix}")
+
+        response = s3_client.list_objects_v2(Bucket=self.bucket_name, Prefix=self.prefix)
+
+
+        if "Contents" not in response:
+            self.log.info("No files found.")
+            return False
+
+        matching_files = []
+
+        for obj in response["Contents"]:
+            file_key = obj["Key"]
+            last_modified = obj["LastModified"]
+
+            # Skip folders
+            if file_key.endswith("/"):
+                continue
+
+            try:
+                # Retrieve file tags
+                tags = s3_client.get_object_tagging(Bucket=self.bucket_name, Key=file_key)["TagSet"]
+                tag_dict = {tag["Key"]: tag["Value"] for tag in tags}
+
+                # Check conditions
+                if tag_dict.get("processed") == "error" or tag_dict.get("data_processed") != "success":
+                    self.log.info(f"File {file_key} is selected (last modified: {last_modified}).")
+                    matching_files.append((file_key, last_modified))
+
+            except Exception as e:
+                self.log.warning(f"Could not get tags for {file_key}. Assuming no tags. Error: {e}")
+                matching_files.append((file_key, last_modified))  # Assume file is new if we can't get tags
+
+        if matching_files:
+            # Get the oldest file (sort by LastModified)
+            oldest_file = sorted(matching_files, key=lambda x: x[1])[0][0]
+
+            # Push to XCom
+            context['ti'].xcom_push(key="file_to_process", value=oldest_file)
+            self.log.info(f"Oldest file selected: {oldest_file} (pushed to XCom).")
+
+            return True  # A matching file was found
+
+        self.log.info("All files are already processed. Waiting for new files...")
+        return False  # No new or error files found
 
 
 def generate_files_identifier(**kwargs):
@@ -299,14 +393,14 @@ def extract_load_data(data, load_id, dag_id=None):
     return load_data
 
 
-def extracting_tables_from_json(file_key, **kwargs):
+def extracting_tables_from_json(file_key, load_id, **kwargs):
     s3 = get_s3_client()
-
+    logging.info(f"load_id: {load_id}")
+    # extract folder from file key
     file_folder = file_key.rsplit("/", 1)[0]
-    load_id = Variable.get("load_id", default_var=None)
 
     logging.info(f"path: {file_key}")
-    file = s3.get_object(Bucket=PROCESSING_BUCKET_NAME, Key=file_key)
+    file = s3.get_object(Bucket=INCOMING_BUCKET_NAME, Key=file_key)
 
     # data = file['Body']
     data = json.load(file['Body'])
@@ -314,7 +408,7 @@ def extracting_tables_from_json(file_key, **kwargs):
     # extrac DAG Id and load id
     context = kwargs
     dag_id = context['dag_run'].run_id
-    load_id= context["ti"].xcom_pull(task_ids="generate_files_identifier", key="load_id")
+
 
     load_data = extract_load_data(data=data,load_id=load_id, dag_id=dag_id)
 
@@ -401,27 +495,90 @@ def load_data_to_redshift(ti):
         conn.close()
     return status
 
-def read_s3_json(file_name, bucket=INCOMING_BUCKET_NAME):
-    """ Helper function to read a Json file from S3 """
-    aws_connection = BaseHook.get_connection("aws_default")
-    aws_access_key = aws_connection.login
-    aws_secret_key = aws_connection.password
-    extra = json.loads(aws_connection.extra) if aws_connection.extra else {}
-    region_name = extra.get("region_name", "eu-west-1")
-    s3 = boto3.client('s3',
-                      aws_access_key_id=aws_access_key,
-                      aws_secret_access_key=aws_secret_key,
-                      region_name=region_name,
-                      endpoint_override="https://s3.eu-west-1.amazonaws.com"
-                      )
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=file_name)
-        logging.info(f"Successfully read {file_name} from S3")
-        return json.load(f)(obj['Body'])
-    except Exception as e:
-        logging.error(f"Failed to read {file_name} from S3: {str(e)}")
-        raise Exception(f"Failed to read {file_name} from S3: {str(e)}")
 
+def branch_task(ti):
+    validation_results = ti.xcom_pull(task_ids='load_data_to_redshift')
+
+    if validation_results == 'success':
+        return 'move_to_archive'
+    else:
+        return 'move_to_error'
+
+
+def move_s3_folder(source_bucket, source_prefix, dest_bucket, dest_prefix):
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+
+    for page in paginator.paginate(Bucket=source_bucket, Prefix=source_prefix):
+        if "Contents" in page:
+            for obj in page["Contents"]:
+                source_key = obj["Key"]
+                dest_key = source_key.replace(source_prefix, dest_prefix, 1)
+
+                # Copy files to a new bucket
+                s3.copy_object(Bucket=dest_bucket,
+                               CopySource={"Bucket": source_bucket, "Key": source_key},
+                               Key=dest_key)
+
+                # Delete old files
+                s3.delete_object(Bucket=source_bucket, Key=source_key)
+
+                print(f"Moved {source_key} from {source_bucket} to {dest_key} in {dest_bucket}")
+class UpdateS3TagOperator(BaseOperator):
+    """
+    Updates a specific tag on an S3 file.
+
+    :param bucket_name: Name of the S3 bucket.
+    :param file_key: (Optional) Key (path) of the file in S3. If None, it will be pulled from XCom.
+    :param xcom_task_id: (Optional) Task ID to pull the file key from XCom.
+    :param xcom_key: (Optional) XCom key where the file name is stored (default: "file_to_process").
+    :param tag_key: The tag key to update.
+    :param tag_value: The value to set for the given tag.
+    :param aws_conn_id: AWS connection ID in Airflow (default: "aws_default").
+    """
+
+    @apply_defaults
+    def __init__(self, bucket_name, tag_key, tag_value, s3_client, file_key=None, xcom_task_id=None, xcom_key="file_to_process",  *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.bucket_name = bucket_name
+        self.file_key = file_key
+        self.xcom_task_id = xcom_task_id
+        self.xcom_key = xcom_key
+        self.tag_key = tag_key
+        self.tag_value = tag_value
+        self.s3_client = s3_client
+
+    def execute(self, context):
+        """Updates the specified tag on the given S3 file."""
+        ti = context["ti"]
+
+        # Get file key: either from input or from XCom
+        file_key = self.file_key or ti.xcom_pull(task_ids=self.xcom_task_id, key=self.xcom_key)
+
+        if not file_key:
+            self.log.warning("No file found to update tags. Skipping.")
+            return
+
+        s3_client = self.s3_client
+
+        # Fetch existing tags
+        try:
+            existing_tags = s3_client.get_object_tagging(Bucket=self.bucket_name, Key=file_key)["TagSet"]
+        except Exception as e:
+            self.log.warning(f"Could not retrieve existing tags for {file_key}: {e}")
+            existing_tags = []
+
+        # Update or add the specified tag
+        updated_tags = {tag["Key"]: tag["Value"] for tag in existing_tags}
+        updated_tags[self.tag_key] = self.tag_value  # Set new value
+
+        # Convert back to AWS format
+        tag_set = [{"Key": k, "Value": v} for k, v in updated_tags.items()]
+
+        # Apply new tags
+        s3_client.put_object_tagging(Bucket=self.bucket_name, Key=file_key, Tagging={"TagSet": tag_set})
+
+        self.log.info(f"Updated tag '{self.tag_key}' for {file_key}: {self.tag_value}")
 
 # Konfiguracja DAG-a
 default_args = {
@@ -432,20 +589,15 @@ default_args = {
 }
 
 with DAG(
-        dag_id="Self_hosted_data_loader",
-        default_args=default_args,
-        schedule_interval="@once",
-        catchup=False,
-) as dag:
-    wait_for_file = S3KeySensor(
-        task_id="wait_for_files",
+        dag_id="Self_hosted_data_loader", default_args=default_args, schedule_interval="@once",
+        catchup=False, max_active_runs=1) as dag:
+    wait_for_new_file = S3TagSensor(
+        task_id="wait_for_new_file",
         bucket_name=INCOMING_BUCKET_NAME,
-        bucket_key='*',
-        wildcard_match=True,
-        aws_conn_id=AWS_CONN_ID,
-        timeout=600,
-        poke_interval=30,
-        mode="poke"
+        prefix='',
+        aws_conn_id="aws_default",
+        poke_interval=60,  # Checks every 60 seconds
+        timeout=600  # Timeout after 10 minutes
     )
     # Generate files id base on run id
     generate_files_identifier = PythonOperator(
@@ -453,41 +605,88 @@ with DAG(
         python_callable=generate_files_identifier,
         provide_context=True,
     )
-    # Identified the oldest file in S3 bucket
-    identified_oldest_json_file = PythonOperator(
-        task_id="identified_oldest_json_file",
-        python_callable=identified_oldest_json_file,
-        provide_context=True,
-        op_kwargs={"source_prefix": '',
-                   "source_bucket": INCOMING_BUCKET_NAME
-                   }
-    )
+    # # Identified the oldest file in S3 bucket
+    # identified_oldest_json_file = PythonOperator(
+    #     task_id="identified_oldest_json_file",
+    #     python_callable=identified_oldest_json_file,
+    #     provide_context=True,
+    #     op_kwargs={"source_prefix": '',
+    #                "source_bucket": INCOMING_BUCKET_NAME
+    #                }
+    # )
 
-    move_to_processing = PythonOperator(
-        task_id="move_to_processing",
-        python_callable=move_s3_file,
-        op_kwargs={"source_file": "{{ ti.xcom_pull(task_ids='identified_oldest_json_file', key='return_value') }}",
-                   "source_bucket": INCOMING_BUCKET_NAME,
-                   "target_bucket": PROCESSING_BUCKET_NAME,
-                   "target_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}"
-                   }
-    )
+    # move_to_processing = PythonOperator(
+    #     task_id="move_to_processing",
+    #     python_callable=move_s3_file,
+    #     op_kwargs={"source_file": "{{ ti.xcom_pull(task_ids='wait_for_new_file', key='file_to_process') }}",
+    #                "source_bucket": INCOMING_BUCKET_NAME,
+    #                "target_bucket": PROCESSING_BUCKET_NAME,
+    #                "target_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}"
+    #                }
+    # )
     extracting_from_json = PythonOperator(
         task_id="extracting_from_json",
         python_callable=extracting_tables_from_json,
         op_kwargs={
-            "file_key": "{{ ti.xcom_pull(task_ids='move_to_processing', key='return_value')['target_file_key'] }}"},
+            "file_key": "{{ ti.xcom_pull(task_ids='wait_for_new_file', key='file_to_process') }}",
+            "load_id": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}"
+        },
         provide_context=True
-    ),
+    )
     load_task = PythonOperator(
         task_id='load_data_to_redshift',
         python_callable=load_data_to_redshift,
         provide_context=True,
     )
+    branch_task = BranchPythonOperator(
+        task_id='branch_task',
+        python_callable=branch_task,
+        provide_context=True
+    )
+    move_to_archive = PythonOperator(
+        task_id="move_to_archive",
+        python_callable=move_s3_folder,
+        op_kwargs={"source_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}",
+                   "source_bucket": PROCESSING_BUCKET_NAME,
+                   "dest_bucket": ARCHIVE_BUCKET_NAME,
+                   "dest_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}",
+                   }
+    )
+
+    move_to_error = PythonOperator(
+        task_id="move_to_error",
+        python_callable=move_s3_folder,
+        op_kwargs={"source_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}",
+                   "source_bucket": PROCESSING_BUCKET_NAME,
+                   "dest_bucket": ERROR_BUCKET_NAME,
+                   "dest_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}",
+                   }
+    )
+    set_processed_tag_success = UpdateS3TagOperator(
+        task_id="set_processed_tag_success",
+        bucket_name=INCOMING_BUCKET_NAME,
+        tag_key="data_processed",
+        tag_value="success",
+        xcom_task_id="wait_for_new_file",
+        s3_client=get_s3_client(),
+        dag=dag
+    )
+    set_processed_tag_error = UpdateS3TagOperator(
+        task_id="set_processed_tag_error",
+        bucket_name=INCOMING_BUCKET_NAME,
+        tag_key="data_processed",
+        tag_value="error",
+        xcom_task_id="wait_for_new_file",
+        s3_client=get_s3_client(),
+        dag=dag
+    )
     restart_dag = TriggerDagRunOperator(
         task_id="restart_dag",
         trigger_dag_id="Self_hosted_data_loader",
-        wait_for_completion=False
+        wait_for_completion=False,
+        trigger_rule="none_failed"
     )
 
-    wait_for_file >> generate_files_identifier >> identified_oldest_json_file >> move_to_processing >> extracting_from_json >> load_task >> restart_dag
+wait_for_new_file >> generate_files_identifier >> extracting_from_json >> load_task >> branch_task >> [move_to_archive, move_to_error]
+move_to_archive >> set_processed_tag_success >> restart_dag
+move_to_error >> set_processed_tag_error >> restart_dag
