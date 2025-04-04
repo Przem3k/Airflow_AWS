@@ -304,6 +304,8 @@ class S3TagSensor(BaseSensorOperator):
 
             # Push to XCom
             context['ti'].xcom_push(key="file_to_process", value=oldest_file)
+            context['ti'].xcom_push(key="source_filename", value=oldest_file.split("/")[-1])
+            context['ti'].xcom_push(key="source_folder"  , value=oldest_file.rsplit("/", 1)[0])
             self.log.info(f"Oldest file selected: {oldest_file} (pushed to XCom).")
 
             return True  # A matching file was found
@@ -337,47 +339,6 @@ def get_s3_client(connection='aws_default'):
     return s3
 
 
-def move_s3_file(source_file, source_bucket, target_bucket, target_prefix):
-    if target_prefix is None:
-        raise ValueError('Target prefix not provided')
-
-    # Extract original file name
-    filename = source_file.split("/")[-1]
-    new_key = f"{target_prefix}/{filename}"
-
-    # Copy and delete
-    logging.info(f"Bucket {source_bucket} - file:{source_file}")
-    s3_hook = S3Hook(aws_conn_id="aws_default")
-    s3_hook.copy_object(source_bucket_name=source_bucket,
-                        source_bucket_key=source_file,
-                        dest_bucket_name=target_bucket,
-                        dest_bucket_key=new_key)
-    s3_hook.delete_objects(source_bucket, source_file)
-
-    print(f"File moved: {source_file} -> {new_key}")
-
-    return {"source_file_key": new_key,
-            "target_file_key": new_key}
-
-
-def identified_oldest_json_file(source_prefix, source_bucket, **kwargs):
-    s3_hook = S3Hook(aws_conn_id="aws_default")
-    files = s3_hook.list_keys(bucket_name=source_bucket, prefix=source_prefix)
-    json_files = [key for key in files if key.endswith('.json')]
-    if not json_files:
-        raise TypeError(f"No json files in bucket: {source_bucket}")
-    # pull files metadata
-    files_info = [
-        (key, s3_hook.get_key(key, bucket_name=source_bucket).last_modified)
-        for key in json_files
-    ]
-    files_info.sort(key=lambda x: x[1])  # The oldest first
-    # oldest file
-    the_oldest_file = files_info[0][0]
-    logging.info(f"Found oldest file {the_oldest_file}")
-    return the_oldest_file
-
-
 def extract_load_data(data, load_id, dag_id=None):
     account = data["account"]
     account['app_version'] = data["spacelift_version"]
@@ -398,6 +359,8 @@ def extracting_tables_from_json(file_key, load_id, **kwargs):
     logging.info(f"load_id: {load_id}")
     # extract folder from file key
     file_folder = file_key.rsplit("/", 1)[0]
+    # extract file name without extension
+    raw_file_name = file_key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
     logging.info(f"path: {file_key}")
     file = s3.get_object(Bucket=INCOMING_BUCKET_NAME, Key=file_key)
@@ -443,12 +406,13 @@ def extracting_tables_from_json(file_key, load_id, **kwargs):
                       quotechar='`',
                       escapechar="\\"
                       , encoding='utf-8')
-            filename = f"{file_folder}/{table}/{load_id}.csv"
+            filename = f"{file_folder}/{table}/{load_id}/{raw_file_name}.csv"
             s3_key = f"{PROCESSING_BUCKET_NAME}/{filename}"
             s3 = get_s3_client()
             s3.put_object(Body=csv_buffer.getvalue(), Bucket=PROCESSING_BUCKET_NAME, Key=filename)
             logging.info(f"Successfully transferred file {filename}")
             files_and_tables.append({"s3_key": s3_key, "table_name": table})
+        context['ti'].xcom_push(key="files_and_tables", value=files_and_tables)
     return files_and_tables
 
 
@@ -505,25 +469,29 @@ def branch_task(ti):
         return 'move_to_error'
 
 
-def move_s3_folder(source_bucket, source_prefix, dest_bucket, dest_prefix):
-    s3 = get_s3_client()
-    paginator = s3.get_paginator("list_objects_v2")
+# def move_s3_files(dest_bucket, ti):
+#     s3 = get_s3_client()
+#     files_and_tables = ti.xcom_pull(task_ids='extracting_from_json')
+#     logging.info(f'files_and_tables:{files_and_tables}')
+#
+#     paginator = s3.get_paginator("list_objects_v2")
+#
+#     for page in paginator.paginate(Bucket=source_bucket, Prefix=source_prefix):
+#         if "Contents" in page:
+#             for obj in page["Contents"]:
+#                 source_key = obj["Key"]
+#                 dest_key = source_key.replace(source_prefix, dest_prefix, 1)
+#
+#                 # Copy files to a new bucket
+#                 s3.copy_object(Bucket=dest_bucket,
+#                                CopySource={"Bucket": source_bucket, "Key": source_key},
+#                                Key=dest_key)
+#
+#                 # Delete old files
+#                 s3.delete_object(Bucket=source_bucket, Key=source_key)
+#
+#                 print(f"Moved {source_key} from {source_bucket} to {dest_key} in {dest_bucket}")
 
-    for page in paginator.paginate(Bucket=source_bucket, Prefix=source_prefix):
-        if "Contents" in page:
-            for obj in page["Contents"]:
-                source_key = obj["Key"]
-                dest_key = source_key.replace(source_prefix, dest_prefix, 1)
-
-                # Copy files to a new bucket
-                s3.copy_object(Bucket=dest_bucket,
-                               CopySource={"Bucket": source_bucket, "Key": source_key},
-                               Key=dest_key)
-
-                # Delete old files
-                s3.delete_object(Bucket=source_bucket, Key=source_key)
-
-                print(f"Moved {source_key} from {source_bucket} to {dest_key} in {dest_bucket}")
 class UpdateS3TagOperator(BaseOperator):
     """
     Updates a specific tag on an S3 file.
@@ -579,7 +547,69 @@ class UpdateS3TagOperator(BaseOperator):
         s3_client.put_object_tagging(Bucket=self.bucket_name, Key=file_key, Tagging={"TagSet": tag_set})
 
         self.log.info(f"Updated tag '{self.tag_key}' for {file_key}: {self.tag_value}")
+class MoveS3FilesOperator(BaseOperator):
+    """
+    Moves a list of S3 files from source buckets to a destination bucket.
 
+    :param s3_paths: List of full S3 paths (e.g., "source-bucket/path/to/file.csv").
+    :param destination_bucket: Target S3 bucket.
+    :param aws_conn_id: AWS connection ID in Airflow (default: "aws_default").
+    :param delete_source: Whether to delete the source files after copying (default: True).
+    """
+
+    @apply_defaults
+    def __init__(self, destination_bucket, xcom_task_id, xcom_key, aws_conn_id="aws_default", delete_source=True, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.destination_bucket = destination_bucket
+        self.aws_conn_id = aws_conn_id
+        self.delete_source = delete_source
+        self.xcom_task_id = xcom_task_id
+        self.xcom_key = xcom_key
+
+    def execute(self, context):
+        """Moves files between S3 buckets by copying and optionally deleting them."""
+
+        ti = context["ti"]
+
+        # Log the XCom fetch attempt
+        self.log.info(f"Attempting to pull from XCom: task_id={self.xcom_task_id}, key={self.xcom_key}")
+
+        # Get files dict from XCom
+        files_and_tables = ti.xcom_pull(task_ids=self.xcom_task_id, key=self.xcom_key)
+
+        self.log.info(f"Retrieved from XCom: {files_and_tables}")
+
+        if not files_and_tables:
+            raise ValueError(f"No data found in XCom for task_id={self.xcom_task_id}, key={self.xcom_key}")
+
+        s3_hook = S3Hook(aws_conn_id=self.aws_conn_id)
+
+        for table_info in files_and_tables:
+            s3_path = table_info["s3_key"]
+            parts = s3_path.split("/", 1)  # Split into bucket and key
+            if len(parts) < 2:
+                self.log.warning(f"Skipping invalid S3 path: {s3_path}")
+                continue
+
+            source_bucket, key = parts
+            destination_key = key  # Keep the same path in the new bucket
+
+            self.log.info(f"Copying {key} from {source_bucket} to {self.destination_bucket}")
+
+            # Copy file to the new bucket
+            s3_hook.copy_object(
+                source_bucket_name=source_bucket,
+                dest_bucket_name=self.destination_bucket,
+                source_bucket_key=key,
+                dest_bucket_key=destination_key,
+            )
+
+            # Optionally delete the original file
+            if self.delete_source:
+                self.log.info(f"Deleting {key} from {source_bucket}")
+                s3_hook.delete_objects(bucket=source_bucket, keys=[key])
+
+            self.log.info(f"Successfully moved {len(files_and_tables)} files to {self.destination_bucket}")
 # Konfiguracja DAG-a
 default_args = {
     "owner": "airflow",
@@ -605,30 +635,11 @@ with DAG(
         python_callable=generate_files_identifier,
         provide_context=True,
     )
-    # # Identified the oldest file in S3 bucket
-    # identified_oldest_json_file = PythonOperator(
-    #     task_id="identified_oldest_json_file",
-    #     python_callable=identified_oldest_json_file,
-    #     provide_context=True,
-    #     op_kwargs={"source_prefix": '',
-    #                "source_bucket": INCOMING_BUCKET_NAME
-    #                }
-    # )
-
-    # move_to_processing = PythonOperator(
-    #     task_id="move_to_processing",
-    #     python_callable=move_s3_file,
-    #     op_kwargs={"source_file": "{{ ti.xcom_pull(task_ids='wait_for_new_file', key='file_to_process') }}",
-    #                "source_bucket": INCOMING_BUCKET_NAME,
-    #                "target_bucket": PROCESSING_BUCKET_NAME,
-    #                "target_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}"
-    #                }
-    # )
     extracting_from_json = PythonOperator(
         task_id="extracting_from_json",
         python_callable=extracting_tables_from_json,
         op_kwargs={
-            "file_key": "{{ ti.xcom_pull(task_ids='wait_for_new_file', key='file_to_process') }}",
+            "file_key": "{{ ti.xcom_pull(task_ids='wait_for_new_file', key='file_to_process', include_prior_dates=False) }}",
             "load_id": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}"
         },
         provide_context=True
@@ -643,25 +654,43 @@ with DAG(
         python_callable=branch_task,
         provide_context=True
     )
-    move_to_archive = PythonOperator(
+    # move_to_archive = PythonOperator(
+    #     task_id="move_to_archive",
+    #     python_callable=move_s3_folder,
+    #     op_kwargs={"source_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}",
+    #                "source_bucket": PROCESSING_BUCKET_NAME,
+    #                "dest_bucket": ARCHIVE_BUCKET_NAME,
+    #                "dest_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}",
+    #                }
+    # )
+    move_to_archive = MoveS3FilesOperator(
         task_id="move_to_archive",
-        python_callable=move_s3_folder,
-        op_kwargs={"source_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}",
-                   "source_bucket": PROCESSING_BUCKET_NAME,
-                   "dest_bucket": ARCHIVE_BUCKET_NAME,
-                   "dest_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}",
-                   }
+        destination_bucket=ARCHIVE_BUCKET_NAME,
+        delete_source=True,
+        xcom_key="files_and_tables",
+        xcom_task_id="extracting_from_json",
+        aws_conn_id="aws_default",
+        dag=dag,
+    )
+    move_to_error = MoveS3FilesOperator(
+        task_id="move_to_error",
+        destination_bucket=ERROR_BUCKET_NAME,
+        delete_source=True,
+        xcom_key="files_and_tables",
+        xcom_task_id="extracting_from_json",
+        aws_conn_id="aws_default",
+        dag=dag,
     )
 
-    move_to_error = PythonOperator(
-        task_id="move_to_error",
-        python_callable=move_s3_folder,
-        op_kwargs={"source_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}",
-                   "source_bucket": PROCESSING_BUCKET_NAME,
-                   "dest_bucket": ERROR_BUCKET_NAME,
-                   "dest_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}",
-                   }
-    )
+    # move_to_error = PythonOperator(
+    #     task_id="move_to_error",
+    #     python_callable=move_s3_folder,
+    #     op_kwargs={"source_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}",
+    #                "source_bucket": PROCESSING_BUCKET_NAME,
+    #                "dest_bucket": ERROR_BUCKET_NAME,
+    #                "dest_prefix": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}",
+    #                }
+    # )
     set_processed_tag_success = UpdateS3TagOperator(
         task_id="set_processed_tag_success",
         bucket_name=INCOMING_BUCKET_NAME,
@@ -687,6 +716,6 @@ with DAG(
         trigger_rule="none_failed"
     )
 
-wait_for_new_file >> generate_files_identifier >> extracting_from_json >> load_task >> branch_task >> [move_to_archive, move_to_error]
-move_to_archive >> set_processed_tag_success >> restart_dag
-move_to_error >> set_processed_tag_error >> restart_dag
+wait_for_new_file >> generate_files_identifier >> extracting_from_json >> load_task >> branch_task
+branch_task >> move_to_archive >> set_processed_tag_success >> restart_dag
+branch_task >> move_to_error >> set_processed_tag_error >> restart_dag
