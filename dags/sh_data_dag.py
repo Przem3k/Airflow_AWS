@@ -222,7 +222,7 @@ tables_profile = {
 }
 # Configuration
 AWS_CONN_ID = "aws_default"
-INCOMING_BUCKET_NAME = 'dev-spacelift-self-hosted-data-incoming'
+#INCOMING_BUCKET_NAME = 'dev-spacelift-self-hosted-data-incoming'
 PROCESSING_BUCKET_NAME = 'dev-spacelift-self-hosted-data-processing'
 ARCHIVE_BUCKET_NAME = 'dev-spacelift-self-hosted-data-archive'
 ERROR_BUCKET_NAME = 'dev-spacelift-self-hosted-data-error'
@@ -432,7 +432,7 @@ def extract_load_data(data, load_id, dag_id=None):
     return load_data
 
 
-def extracting_tables_from_json(file_key, load_id, **kwargs):
+def extracting_tables_from_json(file_bucket, file_key, load_id, **kwargs):
     s3 = get_s3_client()
     logging.info(f"load_id: {load_id}")
     # extract folder from file key
@@ -441,7 +441,7 @@ def extracting_tables_from_json(file_key, load_id, **kwargs):
     raw_file_name = file_key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
     logging.info(f"path: {file_key}")
-    file = s3.get_object(Bucket=INCOMING_BUCKET_NAME, Key=file_key)
+    file = s3.get_object(Bucket=file_bucket, Key=file_key)
 
     # data = file['Body']
     data = json.load(file['Body'])
@@ -566,10 +566,8 @@ class UpdateS3TagOperator(BaseOperator):
     """
 
     @apply_defaults
-    def __init__(self, bucket_name, tag_key, tag_value, s3_client, file_key=None, xcom_task_id=None, xcom_key="file_to_process",  *args, **kwargs):
+    def __init__(self, tag_key, tag_value, s3_client, xcom_task_id=None, xcom_key=None,  *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.bucket_name = bucket_name
-        self.file_key = file_key
         self.xcom_task_id = xcom_task_id
         self.xcom_key = xcom_key
         self.tag_key = tag_key
@@ -579,10 +577,10 @@ class UpdateS3TagOperator(BaseOperator):
     def execute(self, context):
         """Updates the specified tag on the given S3 file."""
         ti = context["ti"]
-
+        bucket_name = ti.xcom_pull(task_ids='wait_for_new_file', key='source_bucket')
         # Get file key: either from input or from XCom
-        file_key = self.file_key or ti.xcom_pull(task_ids=self.xcom_task_id, key=self.xcom_key)
-
+        file_key = ti.xcom_pull(task_ids=self.xcom_task_id, key=self.xcom_key)
+        logging.info(F"Attempt to tag {bucket_name} file {file_key} file with {self.tag_key} : {self.tag_value}")
         if not file_key:
             self.log.warning("No file found to update tags. Skipping.")
             return
@@ -591,7 +589,7 @@ class UpdateS3TagOperator(BaseOperator):
 
         # Fetch existing tags
         try:
-            existing_tags = s3_client.get_object_tagging(Bucket=self.bucket_name, Key=file_key)["TagSet"]
+            existing_tags = s3_client.get_object_tagging(Bucket=bucket_name, Key=file_key)["TagSet"]
         except Exception as e:
             self.log.warning(f"Could not retrieve existing tags for {file_key}: {e}")
             existing_tags = []
@@ -604,7 +602,7 @@ class UpdateS3TagOperator(BaseOperator):
         tag_set = [{"Key": k, "Value": v} for k, v in updated_tags.items()]
 
         # Apply new tags
-        s3_client.put_object_tagging(Bucket=self.bucket_name, Key=file_key, Tagging={"TagSet": tag_set})
+        s3_client.put_object_tagging(Bucket=bucket_name, Key=file_key, Tagging={"TagSet": tag_set})
 
         self.log.info(f"Updated tag '{self.tag_key}' for {file_key}: {self.tag_value}")
 class MoveS3FilesOperator(BaseOperator):
@@ -683,7 +681,7 @@ with DAG(
     wait_for_new_file = MultiS3TagSensor(
         task_id="wait_for_new_file",
         buckets_info=[
-            {"bucket": INCOMING_BUCKET_NAME, "prefix": ""},
+            {"bucket": "dev-spacelift-self-hosted-data-incoming", "prefix": ""},
             {"bucket": "dev-spacelift-self-hosted-data-incoming-2", "prefix": ""},
         ],
         aws_conn_id="aws_default",
@@ -699,6 +697,7 @@ with DAG(
         task_id="extracting_from_json",
         python_callable=extracting_tables_from_json,
         op_kwargs={
+            "file_bucket": "{{ ti.xcom_pull(task_ids='wait_for_new_file', key='source_bucket', include_prior_dates=False) }}",
             "file_key": "{{ ti.xcom_pull(task_ids='wait_for_new_file', key='file_to_process', include_prior_dates=False) }}",
             "load_id": "{{ ti.xcom_pull(task_ids='generate_files_identifier', key='return_value')['load_id'] }}"
         },
@@ -734,21 +733,22 @@ with DAG(
     )
     set_processed_tag_success = UpdateS3TagOperator(
         task_id="set_processed_tag_success",
-        bucket_name=INCOMING_BUCKET_NAME,
         tag_key="data_processed",
         tag_value="success",
+        xcom_key="file_to_process",
         xcom_task_id="wait_for_new_file",
         s3_client=get_s3_client(),
-        dag=dag
+        dag=dag,
     )
     set_processed_tag_error = UpdateS3TagOperator(
         task_id="set_processed_tag_error",
-        bucket_name=INCOMING_BUCKET_NAME,
         tag_key="data_processed",
         tag_value="error",
+        xcom_key="file_to_process",
         xcom_task_id="wait_for_new_file",
         s3_client=get_s3_client(),
-        dag=dag
+        dag=dag,
+
     )
     restart_dag = TriggerDagRunOperator(
         task_id="restart_dag",
