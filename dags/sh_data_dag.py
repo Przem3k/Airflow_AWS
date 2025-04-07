@@ -228,6 +228,10 @@ ARCHIVE_BUCKET_NAME = 'dev-spacelift-self-hosted-data-archive'
 ERROR_BUCKET_NAME = 'dev-spacelift-self-hosted-data-error'
 LOAD_TIME = current_time = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
 IAM_ROLE = 'arn:aws:iam::467135700742:role/ssm-analysis-role'
+#defines tags to mark files as success or failed to load to Redshift
+PROCESSED_TAG_KEY= 'data_processed'
+PROCESSED_TAG_SUCCESS = 'success'
+PROCESSED_TAG_FAIL = 'error'
 
 
 class S3TagSensor(BaseSensorOperator):
@@ -288,9 +292,8 @@ class S3TagSensor(BaseSensorOperator):
                 # Retrieve file tags
                 tags = s3_client.get_object_tagging(Bucket=self.bucket_name, Key=file_key)["TagSet"]
                 tag_dict = {tag["Key"]: tag["Value"] for tag in tags}
-
                 # Check conditions
-                if tag_dict.get("processed") not in  ["error", "success"]:
+                if tag_dict.get(PROCESSED_TAG_KEY) not in  [PROCESSED_TAG_FAIL, PROCESSED_TAG_SUCCESS]:
                     self.log.info(f"File {file_key} is selected (last modified: {last_modified}).")
                     matching_files.append((file_key, last_modified))
 
@@ -354,7 +357,7 @@ class MultiS3TagSensor(BaseSensorOperator):
                 tags = s3_client.get_object_tagging(Bucket=bucket_name, Key=file_key)["TagSet"]
                 tag_dict = {tag["Key"]: tag["Value"] for tag in tags}
 
-                if tag_dict.get("processed") not in ["error", "success"]:
+                if tag_dict.get("data_processed") not in ["error", "success"]:
                     matching_files.append((bucket_name, file_key, last_modified))
             except Exception as e:
                 self.log.warning(f"Could not get tags for {file_key}. Assuming no tags. Error: {e}")
@@ -733,8 +736,8 @@ with DAG(
     )
     set_processed_tag_success = UpdateS3TagOperator(
         task_id="set_processed_tag_success",
-        tag_key="data_processed",
-        tag_value="success",
+        tag_key=PROCESSED_TAG_KEY,
+        tag_value=PROCESSED_TAG_SUCCESS,
         xcom_key="file_to_process",
         xcom_task_id="wait_for_new_file",
         s3_client=get_s3_client(),
@@ -742,8 +745,8 @@ with DAG(
     )
     set_processed_tag_error = UpdateS3TagOperator(
         task_id="set_processed_tag_error",
-        tag_key="data_processed",
-        tag_value="error",
+        tag_key=PROCESSED_TAG_KEY,
+        tag_value=PROCESSED_TAG_FAIL,
         xcom_key="file_to_process",
         xcom_task_id="wait_for_new_file",
         s3_client=get_s3_client(),
