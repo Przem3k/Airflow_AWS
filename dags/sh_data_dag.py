@@ -290,7 +290,7 @@ class S3TagSensor(BaseSensorOperator):
                 tag_dict = {tag["Key"]: tag["Value"] for tag in tags}
 
                 # Check conditions
-                if tag_dict.get("processed") == "error" or tag_dict.get("data_processed") != "success":
+                if tag_dict.get("processed") not in  ["error", "success"]:
                     self.log.info(f"File {file_key} is selected (last modified: {last_modified}).")
                     matching_files.append((file_key, last_modified))
 
