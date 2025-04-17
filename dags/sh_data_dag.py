@@ -1,5 +1,3 @@
-
-
 from airflow import DAG, task
 from airflow.operators.python import PythonOperator
 from airflow.operators.python import BranchPythonOperator
@@ -220,6 +218,7 @@ tables_profile = {
         }
     }
 }
+
 # Configuration
 IAM_ROLE             = Variable.get("IAM_ROLE", default_var='arn:aws:iam::467135700742:role/ssm-analysis-role')
 INCOMING_BUCKET_NAME = Variable.get("INCOMING_BUCKET_NAME", default_var="spacelift-self-hosted-metrics-1c93a89d" )
@@ -229,8 +228,9 @@ AWS_CONN_ID = "aws_default"
 PROCESSING_BUCKET_NAME = f'{env_name}-spacelift-self-hosted-data-processing'
 ARCHIVE_BUCKET_NAME = f'{env_name}-spacelift-self-hosted-data-archive'
 ERROR_BUCKET_NAME = f'{env_name}-spacelift-self-hosted-data-error'
-LOAD_TIME = current_time = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
-#defines tags to mark files as success or failed to load to Redshift
+LOAD_TIME = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
+
+# defines tags to mark files as success or failed to load to Redshift
 PROCESSED_TAG_KEY= 'data_processed'
 PROCESSED_TAG_SUCCESS = 'success'
 PROCESSED_TAG_FAIL = 'error'
@@ -506,13 +506,13 @@ def load_data_to_redshift(ti):
     files_and_tables = ti.xcom_pull(task_ids='extracting_from_json')
     logging.info(f'files_and_tables:{files_and_tables}')
 
-    try:
-        # initiate redshift connection
-        redshift_hook = PostgresHook(postgres_conn_id="redshift_default")
-        conn = redshift_hook.get_conn()
-        cursor = conn.cursor()
-        cursor.execute("BEGIN;")
+    # initiate redshift connection
+    redshift_hook = PostgresHook(postgres_conn_id="redshift_default")
+    conn = redshift_hook.get_conn()
+    cursor = conn.cursor()
+    cursor.execute("BEGIN;")
 
+    try:
         for table_info in files_and_tables:
             table_name = table_info["table_name"]
             s3_key = table_info["s3_key"]
@@ -689,8 +689,8 @@ with DAG(
             {"bucket": INCOMING_BUCKET_NAME, "prefix": ""}
         ],
         aws_conn_id="aws_default",
-        poke_interval=60,
-        timeout=600
+        poke_interval=60 * 5, # 5 min
+        timeout=60 * 60 * 24 * 7 # days
     )
     generate_files_identifier = PythonOperator(
         task_id="generate_files_identifier",
