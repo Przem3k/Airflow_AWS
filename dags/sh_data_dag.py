@@ -221,13 +221,15 @@ tables_profile = {
     }
 }
 # Configuration
+IAM_ROLE             = Variable.get("IAM_ROLE", default_var='arn:aws:iam::467135700742:role/ssm-analysis-role')
+INCOMING_BUCKET_NAME = Variable.get("INCOMING_BUCKET_NAME", default_var="spacelift-self-hosted-metrics-1c93a89d" )
+env_name             = Variable.get("ENV_NAME", default_var="dev")
+
 AWS_CONN_ID = "aws_default"
-#INCOMING_BUCKET_NAME = 'dev-spacelift-self-hosted-data-incoming'
-PROCESSING_BUCKET_NAME = 'dev-spacelift-self-hosted-data-processing'
-ARCHIVE_BUCKET_NAME = 'dev-spacelift-self-hosted-data-archive'
-ERROR_BUCKET_NAME = 'dev-spacelift-self-hosted-data-error'
+PROCESSING_BUCKET_NAME = f'{env_name}-spacelift-self-hosted-data-processing'
+ARCHIVE_BUCKET_NAME = f'{env_name}-spacelift-self-hosted-data-archive'
+ERROR_BUCKET_NAME = f'{env_name}-spacelift-self-hosted-data-error'
 LOAD_TIME = current_time = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
-IAM_ROLE = 'arn:aws:iam::467135700742:role/ssm-analysis-role'
 #defines tags to mark files as success or failed to load to Redshift
 PROCESSED_TAG_KEY= 'data_processed'
 PROCESSED_TAG_SUCCESS = 'success'
@@ -684,8 +686,7 @@ with DAG(
     wait_for_new_file = MultiS3TagSensor(
         task_id="wait_for_new_file",
         buckets_info=[
-            {"bucket": "dev-spacelift-self-hosted-data-incoming", "prefix": ""},
-            {"bucket": "dev-spacelift-self-hosted-data-incoming-2", "prefix": ""},
+            {"bucket": INCOMING_BUCKET_NAME, "prefix": ""}
         ],
         aws_conn_id="aws_default",
         poke_interval=60,
