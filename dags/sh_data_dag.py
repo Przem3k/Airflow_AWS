@@ -478,8 +478,9 @@ def extracting_tables_from_json(file_bucket, file_key, load_id, **kwargs):
             # add account identifier and load_id
             if table not in ['loads']:
                 # excluding metadata table
-                df['account_ulid'] = load_data['ulid']
-                df['load_id'] = load_id
+                df['_self_account_ulid'] = load_data['ulid']
+                df['_self_load_id'] = load_id
+                df['_self_load_at'] = load_data['load_at']
             # dump extracted tables files to S3
             csv_buffer = io.StringIO()
             df.to_csv(path_or_buf=csv_buffer,
