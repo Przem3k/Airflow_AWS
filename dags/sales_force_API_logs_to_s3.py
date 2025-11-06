@@ -1,7 +1,7 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.hooks.base import BaseHook
-from airflow.models import Variable
+from airflow.exceptions import AirflowException
 from datetime import datetime, timedelta
 import requests
 import gzip
@@ -21,7 +21,7 @@ dag = DAG(
     'salesforce_eventlog_to_s3',
     default_args=default_args,
     description='Download Salesforce EventLog files to S3',
-    schedule_interval='0 3 * * *',  # Daily at 3:00 UTC
+    schedule_interval='0 3 * * *',
     catchup=False,
 )
 
@@ -43,12 +43,19 @@ def get_salesforce_connection():
     sf_connection = BaseHook.get_connection('salesforce_default')
     extra = json.loads(sf_connection.extra) if sf_connection.extra else {}
 
+    # Password format: "password|security_token"
+    if '|' in sf_connection.password:
+        password, security_token = sf_connection.password.split('|', 1)
+    else:
+        password = sf_connection.password
+        security_token = extra.get('security_token')
+
     return Salesforce(
         username=sf_connection.login,
-        password=sf_connection.password,
-        security_token=extra.get('security_token'),
+        password=password,
+        security_token=security_token,
         client_id=extra.get('client_id'),
-        domain=extra.get('domain', 'login')  # 'login' or 'test' for sandbox
+        domain=extra.get('domain', 'login')
     )
 
 
@@ -65,13 +72,11 @@ def get_existing_files_in_s3(s3_client, bucket_name, days_back=7, prefix='salesf
         for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
             if 'Contents' in page:
                 for obj in page['Contents']:
-                    # Filter by last modified date
                     last_modified = obj['LastModified'].replace(tzinfo=None)
 
                     if last_modified >= cutoff_date:
                         key = obj['Key']
                         if key.endswith('.csv'):
-                            # Extract ID from key (filename without .csv)
                             file_id = key.split('/')[-1].replace('.csv', '')
                             existing_files.add(file_id)
 
@@ -89,10 +94,8 @@ def download_eventlogs_to_s3(**context):
     s3_client = get_s3_client()
     bucket_name = 'data-spacelift-airflow-sf-imports-dev'
 
-    # Get list of files from last 7 days (faster than checking all history)
     existing_files = get_existing_files_in_s3(s3_client, bucket_name, days_back=7)
 
-    # SOQL Query - last 3 days (max we can recover in case of failure)
     query = """
         SELECT Id, EventType, LogDate, LogFile
         FROM EventLogFile 
@@ -107,6 +110,7 @@ def download_eventlogs_to_s3(**context):
     downloaded = 0
     skipped = 0
     errors = 0
+    error_details = []  # Track error details for reporting
 
     for record in records:
         eventlog_id = record['Id']
@@ -115,18 +119,15 @@ def download_eventlogs_to_s3(**context):
         log_date = datetime.strptime(log_date_str.split('T')[0], '%Y-%m-%d')
         log_file_path = record.get('LogFile')
 
-        # Skip records without LogFile
         if not log_file_path:
             skipped += 1
             continue
 
-        # Check if file already exists in S3
         if eventlog_id in existing_files:
             print(f"⊙ Skipping {eventlog_id} ({event_type}) - already exists in S3")
             skipped += 1
             continue
 
-        # Partitioned S3 path
         s3_key = (
             f"salesforce-eventlogs/"
             f"event_type={event_type}/"
@@ -144,14 +145,12 @@ def download_eventlogs_to_s3(**context):
             response = requests.get(full_url, headers=headers, timeout=60)
             response.raise_for_status()
 
-            # Check if gzip or plain CSV
             content = response.content
             try:
                 log_content = gzip.decompress(content).decode('utf-8')
             except gzip.BadGzipFile:
                 log_content = content.decode('utf-8')
 
-            # Save to S3
             s3_client.put_object(
                 Bucket=bucket_name,
                 Key=s3_key,
@@ -164,7 +163,9 @@ def download_eventlogs_to_s3(**context):
             downloaded += 1
 
         except Exception as e:
-            print(f"✗ Error with {eventlog_id} ({event_type}): {str(e)}")
+            error_msg = f"{eventlog_id} ({event_type}): {str(e)}"
+            print(f"✗ Error with {error_msg}")
+            error_details.append(error_msg)
             errors += 1
 
     print(f"\n{'=' * 60}")
@@ -177,9 +178,32 @@ def download_eventlogs_to_s3(**context):
     print(f"Errors:               {errors}")
     print(f"{'=' * 60}")
 
+    # Push metrics to XCom
     context['ti'].xcom_push(key='downloaded', value=downloaded)
     context['ti'].xcom_push(key='skipped', value=skipped)
     context['ti'].xcom_push(key='errors', value=errors)
+    context['ti'].xcom_push(key='total_records', value=len(records))
+
+    # FAIL task if ANY errors occurred
+    if errors > 0:
+        error_summary = "\n".join(error_details[:5])  # Show first 5 errors
+        if len(error_details) > 5:
+            error_summary += f"\n... and {len(error_details) - 5} more errors"
+
+        raise AirflowException(
+            f"❌ Failed to download {errors} out of {len(records)} EventLogFile records.\n\n"
+            f"Error details:\n{error_summary}\n\n"
+            f"Check logs for full details."
+        )
+
+    # Optional: FAIL if nothing was downloaded AND nothing was skipped (unexpected)
+    if downloaded == 0 and skipped == 0 and len(records) > 0:
+        raise AirflowException(
+            f"⚠️ No files downloaded or skipped, but {len(records)} records found in Salesforce. "
+            "This is unexpected - check S3 permissions and Salesforce API access."
+        )
+
+    print(f"✅ Success: All {downloaded} files downloaded successfully!")
 
 
 download_task = PythonOperator(
