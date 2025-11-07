@@ -3,6 +3,7 @@ from airflow.operators.python import PythonOperator
 from airflow.hooks.base import BaseHook
 from airflow.exceptions import AirflowException
 from datetime import datetime, timedelta
+from airflow.models import Variable
 import requests
 import gzip
 import json
@@ -16,6 +17,7 @@ default_args = {
     'retries': 0,
     'retry_delay': timedelta(minutes=5),
 }
+IMPORT_BUCKET = Variable.get("SF_IMPORT_LOGS_BUCKET", default_var='data-spacelift-airflow-sf-imports-dev')
 
 dag = DAG(
     'salesforce_eventlog_to_s3',
@@ -92,7 +94,7 @@ def download_eventlogs_to_s3(**context):
     """Download EventLogFile from Salesforce and save to S3"""
     sf = get_salesforce_connection()
     s3_client = get_s3_client()
-    bucket_name = 'data-spacelift-airflow-sf-imports-dev'
+    bucket_name = IMPORT_BUCKET
 
     existing_files = get_existing_files_in_s3(s3_client, bucket_name, days_back=7)
 
